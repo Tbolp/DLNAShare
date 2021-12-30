@@ -38,24 +38,32 @@ type CastService struct {
 	file_path     string
 }
 
-func (this *CastService) Init() {
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(("0.0.0.0"))})
-	if err != nil {
-		log.Fatalln(err)
-		return
+func (this *CastService) Init() bool {
+	if atomic.CompareAndSwapInt32(&this.status, 0, -1) {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(("0.0.0.0"))})
+		if err != nil {
+			log.Fatalln(err)
+			return false
+		}
+		this.devices = map[string]Device{}
+		this.conn = conn
+		this.is_search = true
+		go this.searchDevices()
+		go this.httpServer()
+		this.group.Add(1)
+		atomic.StoreInt32(&this.status, 1)
 	}
-	this.devices = map[string]Device{}
-	this.conn = conn
-	this.is_search = true
-	go this.searchDevices()
-	go this.httpServer()
-	this.group.Add(1)
-	atomic.StoreInt32(&this.status, 1)
+	return false
 }
 
-func (this *CastService) Stop() {
-	// this.is_search = false
-	this.group.Wait()
+func (this *CastService) Stop() bool {
+	if atomic.CompareAndSwapInt32(&this.status, 2, -1) {
+		// this.is_search = false
+		this.group.Wait()
+		atomic.StoreInt32(&this.status, 3)
+		return true
+	}
+	return false
 }
 
 func (this *CastService) searchDevices() {
@@ -171,7 +179,10 @@ func (this *CastService) SelectDevice(UDN string) bool {
 	return false
 }
 
-func (this *CastService) CastFile(path string) {
+func (this *CastService) CastFile(path string) bool {
+	if atomic.LoadInt32(&this.status) != 2 {
+		return false
+	}
 	this.file_path = path
 	cur_ip := this.select_device.LocalURL
 	type Action struct {
@@ -195,35 +206,29 @@ func (this *CastService) CastFile(path string) {
 	envelop.EncodingStyle = "http://schemas.xmlsoap.org/soap/encoding/"
 	envelop.Body.ActionName.Xmlns = "urn:schemas-upnp-org:service:AVTransport:1"
 	envelop.Body.ActionName.InstanceID = 0
-	// envelop.Body.ActionName.CurrentURI = "https://www.baidu.com/img/flexible/logo/pc/result.png"
 	envelop.Body.ActionName.CurrentURI = fmt.Sprintf("http://%s:12345/file", cur_ip)
 	data, err := xml.MarshalIndent(&envelop, " ", "  ")
-	// data, err := xml.Marshal(&envelop)
 	if err != nil {
 		log.Fatalln(err)
 	}
-	// fmt.Println(string(data))
-	// data = append([]byte("<?xml version=\"1.0\"?>\r\n"), data...)
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", this.select_device.URLBase, this.select_device.CtrlURL), bytes.NewReader(data))
 	if err != nil {
 		log.Fatalln(err)
 	}
 	req.Header.Set("Content-Type", "text/xml; charset=\"utf-8\"")
 	req.Header.Set("SOAPACTION", "\"urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI\"")
-	data, _ = httputil.DumpRequest(req, true)
-	fmt.Println(string(data))
-	resp, err := http.DefaultClient.Do(req)
+	_, err = http.DefaultClient.Do(req)
 	if err != nil {
-		log.Fatalln(err)
+		log.Println(err)
 	}
-	data, _ = ioutil.ReadAll(resp.Body)
-	fmt.Println(string(data))
+	return false
 }
 
 func main() {
 	srv := CastService{}
 	srv.Init()
 	for len(srv.ListDevices()) == 0 {
+		time.Sleep(time.Second)
 		fmt.Println("test")
 	}
 	srv.SelectDevice(srv.ListDevices()[0].UDN)
