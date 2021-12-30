@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,13 +32,13 @@ type Device struct {
 }
 
 type CastService struct {
-	status        int32
-	conn          *net.UDPConn
-	devices       map[string]Device
-	group         sync.WaitGroup
-	is_search     bool
-	select_device Device
-	file_path     string
+	status           int32
+	conn             *net.UDPConn
+	devices          map[string]Device
+	select_device    Device
+	file_path        string
+	ffserver_process *exec.Cmd
+	ffmpeg_process   *exec.Cmd
 }
 
 func (this *CastService) Init() bool {
@@ -47,29 +50,14 @@ func (this *CastService) Init() bool {
 		}
 		this.devices = map[string]Device{}
 		this.conn = conn
-		this.is_search = true
 		go this.searchDevices()
 		go this.httpServer()
-		this.group.Add(1)
 		atomic.StoreInt32(&this.status, 1)
 	}
 	return false
 }
 
-func (this *CastService) Stop() bool {
-	if atomic.CompareAndSwapInt32(&this.status, 2, -1) {
-		// this.is_search = false
-		this.group.Wait()
-		atomic.StoreInt32(&this.status, 3)
-		return true
-	}
-	return false
-}
-
 func (this *CastService) searchDevices() {
-	defer func() {
-		this.group.Done()
-	}()
 	req, _ := http.NewRequest("M-SEARCH", "*", nil)
 	req.Host = "239.255.255.250:1900"
 	req.Header.Set("Man", "\"ssdp:discover\"")
@@ -77,14 +65,14 @@ func (this *CastService) searchDevices() {
 	req.Header.Set("ST", "upnp:rootdevice")
 	data, _ := httputil.DumpRequest(req, false)
 	resp := make([]byte, 2048)
-	for this.is_search {
+	for {
 		this.conn.WriteToUDP(data, &net.UDPAddr{
 			Port: 1900,
 			IP:   net.ParseIP("239.255.255.250"),
 		})
 		this.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		_, addr, err := this.conn.ReadFrom(resp)
-		if err == nil {
+		if err == nil && addr.(*net.UDPAddr) != nil {
 			c, _ := net.DialUDP("udp", nil, addr.(*net.UDPAddr))
 			local_addr := strings.Split(c.LocalAddr().String(), ":")[0]
 			httpresp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(resp)), nil)
@@ -179,12 +167,7 @@ func (this *CastService) SelectDevice(UDN string) bool {
 	return false
 }
 
-func (this *CastService) CastFile(path string) bool {
-	if atomic.LoadInt32(&this.status) != 2 {
-		return false
-	}
-	this.file_path = path
-	cur_ip := this.select_device.LocalURL
+func (this *CastService) setURL(url string) bool {
 	type Action struct {
 		Xmlns              string `xml:"xmlns:u,attr"`
 		InstanceID         int
@@ -206,20 +189,102 @@ func (this *CastService) CastFile(path string) bool {
 	envelop.EncodingStyle = "http://schemas.xmlsoap.org/soap/encoding/"
 	envelop.Body.ActionName.Xmlns = "urn:schemas-upnp-org:service:AVTransport:1"
 	envelop.Body.ActionName.InstanceID = 0
-	envelop.Body.ActionName.CurrentURI = fmt.Sprintf("http://%s:12345/file", cur_ip)
+	envelop.Body.ActionName.CurrentURI = url
 	data, err := xml.MarshalIndent(&envelop, " ", "  ")
 	if err != nil {
-		log.Fatalln(err)
+		log.Println(err)
+		return false
 	}
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/%s", this.select_device.URLBase, this.select_device.CtrlURL), bytes.NewReader(data))
 	if err != nil {
-		log.Fatalln(err)
+		log.Println(err)
+		return false
 	}
 	req.Header.Set("Content-Type", "text/xml; charset=\"utf-8\"")
 	req.Header.Set("SOAPACTION", "\"urn:schemas-upnp-org:service:AVTransport:1#SetAVTransportURI\"")
 	_, err = http.DefaultClient.Do(req)
 	if err != nil {
 		log.Println(err)
+	}
+	return true
+}
+
+func (this *CastService) stopService() {
+	if this.ffserver_process != nil {
+		this.ffserver_process.Process.Kill()
+		this.ffserver_process.Wait()
+		this.ffserver_process = nil
+	}
+	if this.ffmpeg_process != nil {
+		this.ffmpeg_process.Process.Kill()
+		this.ffmpeg_process.Wait()
+		this.ffserver_process = nil
+	}
+}
+
+func (this *CastService) CastFile(path string) bool {
+	if atomic.CompareAndSwapInt32(&this.status, 2, -1) {
+		this.file_path = path
+		this.stopService()
+		return func() bool {
+			defer func() {
+				atomic.StoreInt32(&this.status, 2)
+			}()
+			return this.setURL(fmt.Sprintf("http://%s:12345/file", this.select_device.LocalURL))
+		}()
+	}
+	return false
+}
+
+func (this *CastService) CastScreen(width, height int) bool {
+	if atomic.CompareAndSwapInt32(&this.status, 2, -1) {
+		this.stopService()
+		return func() bool {
+			defer func() {
+				atomic.StoreInt32(&this.status, 2)
+			}()
+			if runtime.GOOS == "linux" {
+				content := fmt.Sprintf(`
+				Port 23456                     
+				BindAddress 0.0.0.0             
+				MaxHTTPConnections 2000       
+				MaxClients 1000                 
+				MaxBandwidth 1000               
+				CustomLog -                   
+				NoDaemon                        
+				 
+				<Feed feed.ffm>                
+						File /tmp/feed.ffm             
+						FileMaxSize 100M                
+						ACL allow 127.0.0.1             
+				</Feed>
+				 
+				<Stream screen.ts>               
+						Format mpegts                      
+						Feed feed.ffm                              
+						VideoBitRate 128                
+						VideoSize %dx%d              
+						VideoFrameRate 30
+						NoAudio
+				 
+				</Stream>
+			`, width, height)
+				err := ioutil.WriteFile("ffserver.conf", []byte(content), fs.ModePerm)
+				if err != nil {
+					return false
+				}
+				cmd1 := exec.Command("ffserver", "-f", "ffserver.conf")
+				cmd1.Start()
+				this.ffserver_process = cmd1
+				time.Sleep(time.Second)
+				cmd2 := exec.Command("ffmpeg", "-f", "x11grab", "-s", fmt.Sprintf("%dx%d", width, height), "-r", "30", "-i", ":0.0", "http://127.0.0.1:23456/feed.ffm")
+				cmd2.Start()
+				this.ffmpeg_process = cmd2
+				return this.setURL(fmt.Sprintf("http://%s:23456/screen.ts", this.select_device.LocalURL))
+			} else {
+				return false
+			}
+		}()
 	}
 	return false
 }
@@ -232,6 +297,10 @@ func main() {
 		fmt.Println("test")
 	}
 	srv.SelectDevice(srv.ListDevices()[0].UDN)
-	srv.CastFile("/home/tbolp/Pictures/icon.jpeg")
-	srv.Stop()
+	srv.CastScreen(1920, 1080)
+	// srv.CastFile("/home/tbolp/Pictures/icon.jpeg")
+	// srv.CastFile("/home/tbolp/Videos/Smooth Criminal.mp4")
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	wg.Wait()
 }
