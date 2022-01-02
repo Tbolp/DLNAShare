@@ -400,7 +400,7 @@ func (this *CastService) CastScreen(width, height int) bool {
 				atomic.StoreInt32(&this.status, 2)
 			}()
 			if runtime.GOOS == "linux" {
-				cmd2 := exec.Command("ffmpeg", "-f", "x11grab", "-s", fmt.Sprintf("%dx%d", width, height), "-r", "30", "-i", ":0.0", "http://127.0.0.1:23456/live")
+				cmd2 := exec.Command("ffmpeg", "-f", "x11grab", "-s", fmt.Sprintf("%dx%d", width, height), "-r", "30", "-i", ":0.0", "-f", "flv", "http://127.0.0.1:12345/live")
 				cmd2.Start()
 				this.ffmpeg_process = cmd2
 				return this.setURL(fmt.Sprintf("http://%s:12345/live", this.select_device.LocalURL))
