@@ -3,9 +3,10 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/xml"
 	"fmt"
-	"io/fs"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -32,13 +33,19 @@ type Device struct {
 }
 
 type CastService struct {
-	status           int32
-	conn             *net.UDPConn
-	devices          map[string]Device
-	select_device    Device
-	file_path        string
-	ffserver_process *exec.Cmd
-	ffmpeg_process   *exec.Cmd
+	status            int32
+	conn              *net.UDPConn
+	devices           map[string]Device
+	select_device     Device
+	file_path         string
+	ffmpeg_process    *exec.Cmd
+	productor         int32
+	consumer          int32
+	flv_header        []byte
+	flv_script        []byte
+	flv_video         []byte
+	buf               chan []byte
+	is_need_key_frame bool
 }
 
 func (this *CastService) Init() bool {
@@ -51,6 +58,8 @@ func (this *CastService) Init() bool {
 		this.devices = map[string]Device{}
 		this.conn = conn
 		go this.searchDevices()
+		this.flv_header = make([]byte, 9)
+		this.buf = make(chan []byte)
 		go this.httpServer()
 		atomic.StoreInt32(&this.status, 1)
 	}
@@ -141,6 +150,158 @@ func (this *CastService) httpServer() {
 	engine.GET("/file", func(c *gin.Context) {
 		c.File(this.file_path)
 	})
+	engine.POST("/live", func(c *gin.Context) {
+		if atomic.CompareAndSwapInt32(&this.productor, 0, 1) {
+			func() {
+				defer atomic.StoreInt32(&this.productor, 0)
+				tmp_pre_tag_header := make([]byte, 15)
+				status := 0
+				for {
+					var err error = nil
+					switch status {
+					case 0:
+						_, err = io.ReadFull(c.Request.Body, this.flv_header)
+						if err != nil {
+							break
+						}
+						status = 1
+					case 1:
+						_, err = io.ReadFull(c.Request.Body, tmp_pre_tag_header)
+						if err != nil {
+							break
+						}
+						if tmp_pre_tag_header[4] != 18 {
+							err = fmt.Errorf("not script tag")
+							break
+						}
+						size := Uint32(tmp_pre_tag_header[5:8])
+						data := make([]byte, size)
+						_, err = io.ReadFull(c.Request.Body, data)
+						if err != nil {
+							break
+						}
+						this.flv_script = make([]byte, 11+size)
+						copy(this.flv_script, tmp_pre_tag_header[4:])
+						copy(this.flv_script[11:], data)
+						status = 2
+					case 2:
+						_, err = io.ReadFull(c.Request.Body, tmp_pre_tag_header)
+						if err != nil {
+							break
+						}
+						if tmp_pre_tag_header[4] != 9 {
+							err = fmt.Errorf("not video tag")
+							break
+						}
+						size := Uint32(tmp_pre_tag_header[5:8])
+						data := make([]byte, size)
+						_, err = io.ReadFull(c.Request.Body, data)
+						if err != nil {
+							break
+						}
+						this.flv_video = make([]byte, 11+size)
+						copy(this.flv_video, tmp_pre_tag_header[4:])
+						copy(this.flv_video[11:], data)
+						status = 3
+					case 3:
+						_, err = io.ReadFull(c.Request.Body, tmp_pre_tag_header)
+						if err != nil {
+							break
+						}
+						if tmp_pre_tag_header[4] != 9 {
+							err = fmt.Errorf("not video tag")
+							break
+						}
+						size := Uint32(tmp_pre_tag_header[5:8])
+						data := make([]byte, size)
+						_, err = io.ReadFull(c.Request.Body, data)
+						if err != nil {
+							break
+						}
+						tag := make([]byte, 11+size)
+						copy(tag, tmp_pre_tag_header[4:])
+						copy(tag[11:], data)
+						is_key := false
+						if data[0]>>4 == 1 {
+							is_key = true
+						}
+						if this.consumer == 1 {
+							if this.is_need_key_frame && !is_key {
+								break
+							}
+							this.is_need_key_frame = false
+							this.buf <- tag
+						}
+					}
+					if err != nil {
+						log.Println(err)
+						break
+					}
+
+				}
+			}()
+		} else {
+			log.Println("Connector Exists")
+		}
+	})
+	engine.GET("/live", func(c *gin.Context) {
+		if atomic.LoadInt32(&this.productor) == 1 && atomic.CompareAndSwapInt32(&this.consumer, 0, 1) {
+			func() {
+				defer func() {
+					atomic.StoreInt32(&this.consumer, -1)
+					select {
+					case <-this.buf:
+					case <-time.After(time.Second * 2):
+					}
+					atomic.StoreInt32(&this.consumer, 0)
+				}()
+
+				c.Writer.Header().Add("content-type", "video/x-flv")
+				c.Writer.Header().Del("Content-Length")
+
+				pre_tag_size := uint32(0)
+				pre_tag_size_buf := make([]byte, 4)
+				start_timestamp := uint32(0)
+
+				c.Writer.Write(this.flv_header)
+
+				binary.BigEndian.PutUint32(pre_tag_size_buf, pre_tag_size)
+				c.Writer.Write(pre_tag_size_buf)
+				c.Writer.Write(this.flv_script)
+				pre_tag_size = uint32(len(this.flv_script))
+
+				binary.BigEndian.PutUint32(pre_tag_size_buf, pre_tag_size)
+				c.Writer.Write(pre_tag_size_buf)
+				c.Writer.Write(this.flv_video)
+				pre_tag_size = uint32(len(this.flv_video))
+
+				cancel := false
+				this.is_need_key_frame = true
+				for !cancel {
+					select {
+					case b := <-this.buf:
+						binary.BigEndian.PutUint32(pre_tag_size_buf, pre_tag_size)
+						c.Writer.Write(pre_tag_size_buf)
+						if start_timestamp == 0 {
+							start_timestamp = Uint32(b[4:7])
+						}
+						timestamp := Uint32(b[4:7]) - start_timestamp
+						binary.BigEndian.PutUint32(pre_tag_size_buf, timestamp)
+						copy(b[4:7], pre_tag_size_buf[1:4])
+						c.Writer.Write(b)
+						pre_tag_size = uint32(len(b))
+						c.Writer.Flush()
+						pre_tag_size = uint32(len(b))
+					case <-c.Request.Context().Done():
+						cancel = true
+						break
+					}
+				}
+			}()
+		} else {
+			log.Println("No Input")
+		}
+	})
 	engine.Run(":12345")
 }
 
@@ -210,15 +371,10 @@ func (this *CastService) setURL(url string) bool {
 }
 
 func (this *CastService) stopService() {
-	if this.ffserver_process != nil {
-		this.ffserver_process.Process.Kill()
-		this.ffserver_process.Wait()
-		this.ffserver_process = nil
-	}
 	if this.ffmpeg_process != nil {
 		this.ffmpeg_process.Process.Kill()
 		this.ffmpeg_process.Wait()
-		this.ffserver_process = nil
+		this.ffmpeg_process = nil
 	}
 }
 
@@ -244,43 +400,15 @@ func (this *CastService) CastScreen(width, height int) bool {
 				atomic.StoreInt32(&this.status, 2)
 			}()
 			if runtime.GOOS == "linux" {
-				content := fmt.Sprintf(`
-				Port 23456                     
-				BindAddress 0.0.0.0             
-				MaxHTTPConnections 2000       
-				MaxClients 1000                 
-				MaxBandwidth 1000               
-				CustomLog -                   
-				NoDaemon                        
-				 
-				<Feed feed.ffm>                
-						File /tmp/feed.ffm             
-						FileMaxSize 100M                
-						ACL allow 127.0.0.1             
-				</Feed>
-				 
-				<Stream screen.ts>               
-						Format mpegts                      
-						Feed feed.ffm                              
-						VideoBitRate 128                
-						VideoSize %dx%d              
-						VideoFrameRate 30
-						NoAudio
-				 
-				</Stream>
-			`, width, height)
-				err := ioutil.WriteFile("ffserver.conf", []byte(content), fs.ModePerm)
-				if err != nil {
-					return false
-				}
-				cmd1 := exec.Command("ffserver", "-f", "ffserver.conf")
-				cmd1.Start()
-				this.ffserver_process = cmd1
-				time.Sleep(time.Second)
-				cmd2 := exec.Command("ffmpeg", "-f", "x11grab", "-s", fmt.Sprintf("%dx%d", width, height), "-r", "30", "-i", ":0.0", "http://127.0.0.1:23456/feed.ffm")
+				cmd2 := exec.Command("ffmpeg", "-f", "x11grab", "-s", fmt.Sprintf("%dx%d", width, height), "-r", "30", "-i", ":0.0", "http://127.0.0.1:23456/live")
 				cmd2.Start()
 				this.ffmpeg_process = cmd2
-				return this.setURL(fmt.Sprintf("http://%s:23456/screen.ts", this.select_device.LocalURL))
+				return this.setURL(fmt.Sprintf("http://%s:12345/live", this.select_device.LocalURL))
+			} else if runtime.GOOS == "windows" {
+				cmd2 := exec.Command("ffmpeg", "-f", "gdigrab", "-i", "desktop", "-f", "flv", "http://127.0.0.1:12345/live")
+				cmd2.Start()
+				this.ffmpeg_process = cmd2
+				return this.setURL(fmt.Sprintf("http://%s:12345/live", this.select_device.LocalURL))
 			} else {
 				return false
 			}
@@ -297,10 +425,17 @@ func main() {
 		fmt.Println("test")
 	}
 	srv.SelectDevice(srv.ListDevices()[0].UDN)
+	time.Sleep(3 * time.Second)
+	// srv.CastFile("C:\\Users\\Tbolp\\Videos\\【僕の戦争】《进击的巨人》最终章 绝对阳间指弹！.mp4")
 	srv.CastScreen(1920, 1080)
 	// srv.CastFile("/home/tbolp/Pictures/icon.jpeg")
 	// srv.CastFile("/home/tbolp/Videos/Smooth Criminal.mp4")
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	wg.Wait()
+}
+
+func Uint32(b []byte) uint32 {
+	_ = b[2]
+	return uint32(b[2]) | uint32(b[1])<<8 | uint32(b[0])<<16
 }
